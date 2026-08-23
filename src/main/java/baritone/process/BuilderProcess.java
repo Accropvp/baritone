@@ -34,12 +34,15 @@ import baritone.api.schematic.RotatedSchematic;
 import baritone.api.schematic.MirroredSchematic;
 import baritone.api.schematic.format.ISchematicFormat;
 import baritone.api.utils.*;
+import baritone.api.utils.Rotation;
 import baritone.api.utils.input.Input;
 import baritone.pathing.movement.CalculationContext;
 import baritone.pathing.movement.Movement;
 import baritone.pathing.movement.MovementHelper;
 import baritone.utils.BaritoneProcessHelper;
 import baritone.utils.BlockStateInterface;
+import baritone.utils.DummyWorld.BlockPlacementAnalyzer;
+import baritone.utils.DummyWorld.BlockPlacementBehavior;
 import baritone.utils.PathingCommandContext;
 import baritone.utils.schematic.MapArtSchematic;
 import baritone.utils.schematic.SelectionSchematic;
@@ -58,25 +61,22 @@ import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.item.context.UseOnContext;
-import net.minecraft.world.level.block.AirBlock;
-import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.HorizontalDirectionalBlock;
-import net.minecraft.world.level.block.LiquidBlock;
-import net.minecraft.world.level.block.PipeBlock;
-import net.minecraft.world.level.block.RotatedPillarBlock;
-import net.minecraft.world.level.block.StairBlock;
-import net.minecraft.world.level.block.TrapDoorBlock;
+import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.state.properties.Property;
+import net.minecraft.world.level.block.state.properties.SlabType;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
+import javax.annotation.Nullable;
 import java.io.File;
 import java.io.FileInputStream;
 import java.util.*;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -187,7 +187,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     @Override
     public boolean build(String name, File schematic, Vec3i origin) {
         Optional<ISchematicFormat> format = SchematicSystem.INSTANCE.getByFile(schematic);
-        if (!format.isPresent()) {
+        if (format.isEmpty()) {
             return false;
         }
         IStaticSchematic parsed;
@@ -281,10 +281,12 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
 
     private Optional<Tuple<BetterBlockPos, Rotation>> toBreakNearPlayer(BuilderCalculationContext bcc) {
         BetterBlockPos center = ctx.playerFeet();
+        double reach = ctx.playerController().getBlockReachDistance();
+        int ceilReach = (int) Math.ceil(reach);
         BetterBlockPos pathStart = baritone.getPathingBehavior().pathStart();
-        for (int dx = -5; dx <= 5; dx++) {
-            for (int dy = Baritone.settings().breakFromAbove.value ? -1 : 0; dy <= 5; dy++) {
-                for (int dz = -5; dz <= 5; dz++) {
+        for (int dx = -ceilReach; dx <= ceilReach; dx++) {
+            for (int dy = Baritone.settings().breakFromAbove.value ? -1 : 0; dy <= ceilReach; dy++) {
+                for (int dz = -ceilReach; dz <= ceilReach; dz++) {
                     int x = center.x + dx;
                     int y = center.y + dy;
                     int z = center.z + dz;
@@ -296,7 +298,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                         continue; // irrelevant
                     }
                     BlockState curr = bcc.bsi.get0(x, y, z);
-                    if (!(curr.getBlock() instanceof AirBlock) && !(curr.getBlock() == Blocks.WATER || curr.getBlock() == Blocks.LAVA) && !valid(curr, desired, false)) {
+                    if (!(curr.getBlock() instanceof AirBlock) && !(curr.getBlock() == Blocks.WATER || curr.getBlock() == Blocks.LAVA) && !valid(curr, desired, false) && shouldBreakByProperty(curr, desired)) {
                         BetterBlockPos pos = new BetterBlockPos(x, y, z);
                         Optional<Rotation> rot = RotationUtils.reachable(ctx, pos, ctx.playerController().getBlockReachDistance());
                         if (rot.isPresent()) {
@@ -307,6 +309,35 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             }
         }
         return Optional.empty();
+    }
+
+    private boolean shouldBreakByProperty(BlockState current, BlockState desired){
+        if (current.getBlock() != desired.getBlock()){ return true; }
+        Optional<SlabType> desiredSlabType = desired.getOptionalValue(BlockStateProperties.SLAB_TYPE);
+        Optional<SlabType> currentSlabType = current.getOptionalValue(BlockStateProperties.SLAB_TYPE);
+
+        if (desiredSlabType.isPresent()){
+            if (currentSlabType.isEmpty()) { return true; }
+            if (desiredSlabType.get() == SlabType.DOUBLE) { return false; }
+            return desiredSlabType.get() != currentSlabType.get();
+        }
+        Map<String, String> desiredProperties = BlockPlacementAnalyzer.mapProperties(desired);
+        Map<Direction, Boolean> desiredDirectionPropertyLinker = createDirectionPropertyLinker(desiredProperties);
+
+        if (!desiredDirectionPropertyLinker.isEmpty()){
+            BlockPlacementBehavior blockBehavior = BlockPlacementAnalyzer.getDirectionProperty(desired.getBlock());
+            if (blockBehavior == BlockPlacementBehavior.CONNECTS_TO_NEIGHBORS){
+                return false;
+            } else if (blockBehavior == BlockPlacementBehavior.FACES_OPPOSITE_FROM_HIT_FACE){
+                Map<String, String> currentProperties = BlockPlacementAnalyzer.mapProperties(current);
+                Map<Direction, Boolean> currentDirectionPropertyLinker = createDirectionPropertyLinker(currentProperties);
+                for (Map.Entry<Direction, Boolean> currentDirectionProperty : currentDirectionPropertyLinker.entrySet()){
+                    if (currentDirectionProperty.getValue() && !desiredDirectionPropertyLinker.get(currentDirectionProperty.getKey())) { return true; }
+                }
+                return false;
+            }
+        }
+        return true;
     }
 
     public static class Placement {
@@ -324,11 +355,18 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         }
     }
 
-    private Optional<Placement> searchForPlacables(BuilderCalculationContext bcc, List<BlockState> desirableOnHotbar) {
-        BetterBlockPos center = ctx.playerFeet();
-        for (int dx = -5; dx <= 5; dx++) {
-            for (int dy = -5; dy <= 1; dy++) {
-                for (int dz = -5; dz <= 5; dz++) {
+    private Optional<Placement> searchForBlockToPlaceNow(BuilderCalculationContext bcc, List<BlockState> desirableOnHotbar) {
+        //TODO: center may not be right
+        BetterBlockPos center = ctx.viewerPos();
+        double reach = ctx.playerController().getBlockReachDistance();
+        int ceilReach = (int) Math.ceil(reach);
+        int maxDy = ceilReach;
+        if (Baritone.settings().buildInLayers.value){
+            maxDy = layer + origin.getY() - center.getY();
+        }
+        for (int dx = -ceilReach; dx <= ceilReach; dx++) {
+            for (int dy = -ceilReach; dy <= maxDy; dy++) {
+                for (int dz = -ceilReach; dz <= ceilReach; dz++) {
                     int x = center.x + dx;
                     int y = center.y + dy;
                     int z = center.z + dz;
@@ -337,10 +375,8 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                         continue; // irrelevant
                     }
                     BlockState curr = bcc.bsi.get0(x, y, z);
-                    if (MovementHelper.isReplaceable(x, y, z, curr, bcc.bsi) && !valid(curr, desired, false)) {
-                        if (dy == 1 && bcc.bsi.get0(x, y + 1, z).getBlock() instanceof AirBlock) {
-                            continue;
-                        }
+
+                    if (MovementHelper.isReplaceable(x, y, z, curr, bcc.bsi) && !valid(curr, desired, false) && shouldPlaceByProperty(curr, desired)) {
                         desirableOnHotbar.add(desired);
                         Optional<Placement> opt = possibleToPlace(desired, x, y, z, bcc.bsi);
                         if (opt.isPresent()) {
@@ -351,6 +387,42 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             }
         }
         return Optional.empty();
+    }
+
+    private boolean shouldPlaceByProperty(BlockState current, BlockState desired){
+        //TODO: direction properties is not handled properly
+
+        if (current.isAir()) { return true; }
+        if (desired.getProperties().isEmpty()){ return true; }
+
+        if (current.getBlock() != desired.getBlock()) { return false; }
+
+        Optional<SlabType> desiredSlabType = desired.getOptionalValue(BlockStateProperties.SLAB_TYPE);
+        if (desiredSlabType.isPresent()){
+            return desiredSlabType.get() == SlabType.DOUBLE;
+        }
+        Map<String, String> desiredProperties = BlockPlacementAnalyzer.mapProperties(desired);
+        Map<Direction, Boolean> desiredDirectionPropertyLinker = createDirectionPropertyLinker(desiredProperties);
+
+        if (!desiredDirectionPropertyLinker.isEmpty()){
+            switch (BlockPlacementAnalyzer.getDirectionProperty(desired.getBlock())){
+                case FACES_OPPOSITE_FROM_HIT_FACE -> {
+                    Map<String, String> currentProperties = BlockPlacementAnalyzer.mapProperties(current);
+                    Map<Direction, Boolean> currentDirectionPropertyLinker = createDirectionPropertyLinker(currentProperties);
+                    //boolean needMore = false;
+                    for (Map.Entry<Direction, Boolean> desiredDirectionProperty : desiredDirectionPropertyLinker.entrySet()){
+                        //if (!desiredDirectionProperty.getValue() && currentDirectionPropertyLinker.get(desiredDirectionProperty.getKey())) { return false; }
+                        if (desiredDirectionProperty.getValue() && !currentDirectionPropertyLinker.get(desiredDirectionProperty.getKey())) { return true; }
+                    }
+                    return false;
+                }
+                case CONNECTS_TO_NEIGHBORS -> {
+                    return false;
+                }
+                default -> throw new IllegalStateException("this placement property shouldn't be with the direction property");
+            }
+        }
+        return true;
     }
 
     public boolean placementPlausible(BlockPos pos, BlockState state) {
@@ -384,7 +456,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                 Rotation actualRot = baritone.getLookBehavior().getAimProcessor().peekRotation(rot);
                 HitResult result = RayTraceUtils.rayTraceTowards(ctx.player(), actualRot, ctx.playerController().getBlockReachDistance(), true);
                 if (result != null && result.getType() == HitResult.Type.BLOCK && ((BlockHitResult) result).getBlockPos().equals(placeAgainstPos) && ((BlockHitResult) result).getDirection() == against.getOpposite()) {
-                    OptionalInt hotbar = hasAnyItemThatWouldPlace(toPlace, result, actualRot);
+                    OptionalInt hotbar = hasAnyItemThatWouldPlace(toPlace, result, actualRot, bsi.get0(x, y, z));
                     if (hotbar.isPresent()) {
                         return Optional.of(new Placement(hotbar.getAsInt(), placeAgainstPos, against.getOpposite(), rot));
                     }
@@ -394,7 +466,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         return Optional.empty();
     }
 
-    private OptionalInt hasAnyItemThatWouldPlace(BlockState desired, HitResult result, Rotation rot) {
+    private OptionalInt hasAnyItemThatWouldPlace(BlockState desired, HitResult result, Rotation rot, BlockState current) {
         for (int i = 0; i < 9; i++) {
             ItemStack stack = ctx.player().getInventory().items.get(i);
             if (stack.isEmpty() || !(stack.getItem() instanceof BlockItem)) {
@@ -420,6 +492,12 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             }
             if (!meme.canPlace()) {
                 continue;
+            }
+            if (sameBlockstate(wouldBePlaced, current)){
+                return OptionalInt.empty();
+            }
+            if (!desired.getProperties().isEmpty() && approxValid(wouldBePlaced, desired, true)){
+                return OptionalInt.of(i);
             }
             if (valid(wouldBePlaced, desired, true)) {
                 return OptionalInt.of(i);
@@ -564,13 +642,14 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
         }
         List<BlockState> desirableOnHotbar = new ArrayList<>();
-        Optional<Placement> toPlace = searchForPlacables(bcc, desirableOnHotbar);
-        if (toPlace.isPresent() && isSafeToCancel && ctx.player().isOnGround() && ticks <= 0) {
-            Rotation rot = toPlace.get().rot;
+        Optional<Placement> toPlaceOption = searchForBlockToPlaceNow(bcc, desirableOnHotbar);
+        if (toPlaceOption.isPresent() && isSafeToCancel && ctx.player().isOnGround() && ticks <= 0) {
+            Placement toPlace = toPlaceOption.get();
+            Rotation rot = toPlace.rot;
             baritone.getLookBehavior().updateTarget(rot, true);
-            ctx.player().getInventory().selected = toPlace.get().hotbarSelection;
+            ctx.player().getInventory().selected = toPlace.hotbarSelection;
             baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
-            if ((ctx.isLookingAt(toPlace.get().placeAgainst) && ((BlockHitResult) ctx.objectMouseOver()).getDirection().equals(toPlace.get().side)) || ctx.playerRotations().isReallyCloseTo(rot)) {
+            if ((ctx.isLookingAt(toPlace.placeAgainst) && ((BlockHitResult) ctx.objectMouseOver()).getDirection().equals(toPlace.side)) || ctx.playerRotations().isReallyCloseTo(rot)) {
                 baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_RIGHT, true);
             }
             return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
@@ -582,7 +661,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             outer:
             for (BlockState desired : desirableOnHotbar) {
                 for (int i = 0; i < 9; i++) {
-                    if (valid(approxPlaceable.get(i), desired, true)) {
+                    if (itemApproxValid(approxPlaceable.get(i), desired, true)) {
                         usefulSlots.add(i);
                         continue outer;
                     }
@@ -593,7 +672,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             outer:
             for (int i = 9; i < 36; i++) {
                 for (BlockState desired : noValidHotbarOption) {
-                    if (valid(approxPlaceable.get(i), desired, true)) {
+                    if (itemApproxValid(approxPlaceable.get(i), desired, true)) {
                         if (!baritone.getInventoryBehavior().attemptToPutOnHotbar(i, usefulSlots::contains)) {
                             // awaiting inventory move, so pause
                             return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
@@ -605,20 +684,21 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         }
 
         Goal goal = assemble(bcc, approxPlaceable.subList(0, 9));
-        if (goal == null) {
-            goal = assemble(bcc, approxPlaceable, true); // we're far away, so assume that we have our whole inventory to recalculate placeable properly
-            if (goal == null) {
-                if (Baritone.settings().skipFailedLayers.value && Baritone.settings().buildInLayers.value && layer * Baritone.settings().layerHeight.value < realSchematic.heightY()) {
-                    logDirect("Skipping layer that I cannot construct! Layer #" + layer);
-                    layer++;
-                    return onTick(calcFailed, isSafeToCancel, recursions + 1);
-                }
-                logDirect("Unable to do it. Pausing. resume to resume, cancel to cancel");
-                paused = true;
-                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
-            }
+        if (goal != null){
+            return new PathingCommandContext(goal, PathingCommandType.FORCE_REVALIDATE_GOAL_AND_PATH, bcc);
         }
-        return new PathingCommandContext(goal, PathingCommandType.FORCE_REVALIDATE_GOAL_AND_PATH, bcc);
+        goal = assemble(bcc, approxPlaceable, true); // we're far away, so assume that we have our whole inventory to recalculate placeable properly
+        if (goal != null){
+            return new PathingCommandContext(goal, PathingCommandType.FORCE_REVALIDATE_GOAL_AND_PATH, bcc);
+        }
+        if (Baritone.settings().skipFailedLayers.value && Baritone.settings().buildInLayers.value && layer * Baritone.settings().layerHeight.value < realSchematic.heightY()) {
+            logDirect("Skipping layer that I cannot construct! Layer #" + layer);
+            layer++;
+            return onTick(calcFailed, isSafeToCancel, recursions + 1);
+        }
+        logDirect("Unable to do it. Pausing. resume to resume, cancel to cancel");
+        paused = true;
+        return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
     }
 
     private boolean recalc(BuilderCalculationContext bcc) {
@@ -714,13 +794,20 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     }
 
     private Goal assemble(BuilderCalculationContext bcc, List<BlockState> approxPlaceable, boolean logMissing) {
+        List<Pair<BetterBlockPos, BlockState>> specialPlaceable = new ArrayList<>();
         List<BetterBlockPos> placeable = new ArrayList<>();
         List<BetterBlockPos> breakable = new ArrayList<>();
         List<BetterBlockPos> sourceLiquids = new ArrayList<>();
         List<BetterBlockPos> flowingLiquids = new ArrayList<>();
         Map<BlockState, Integer> missing = new HashMap<>();
         List<BetterBlockPos> outOfBounds = new ArrayList<>();
-        incorrectPositions.forEach(pos -> {
+        Stream<BetterBlockPos> blockToAttribute;
+        if (Baritone.settings().buildInLayers.value){
+            blockToAttribute = incorrectPositions.stream().filter(pos -> pos.getY() <= layer + origin.getY());
+        } else {
+            blockToAttribute = incorrectPositions.stream();
+        }
+        blockToAttribute.forEach(pos -> {
             BlockState state = bcc.bsi.get0(pos);
             if (state.getBlock() instanceof AirBlock) {
                 BlockState desired = bcc.getSchematic(pos.x, pos.y, pos.z, state);
@@ -728,6 +815,8 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                     outOfBounds.add(pos);
                 } else if (containsBlockState(approxPlaceable, desired)) {
                     placeable.add(pos);
+                } else if (approxPlaceableContainsBlockType(approxPlaceable, desired.getBlock()) && !desired.getProperties().isEmpty()) {
+                    specialPlaceable.add(new Pair<>(pos, desired));
                 } else {
                     missing.put(desired, 1 + missing.getOrDefault(desired, 0));
                 }
@@ -755,8 +844,18 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                 toPlace.add(placementGoal(pos, bcc));
             }
         });
+        List<Goal> specialToPlace = new ArrayList<>();
+        for (Pair<BetterBlockPos, BlockState> special : specialPlaceable){
+            Goal goal = specialPlacementGoal(bcc, special.second(), special.first());
+            if (goal != null){
+                specialToPlace.add(goal);
+            }
+        }
         sourceLiquids.forEach(pos -> toPlace.add(new GoalBlock(pos.above())));
 
+        if (!specialToPlace.isEmpty()){
+            return new JankyGoalComposite(new GoalComposite(specialToPlace.toArray(new Goal[0])), new GoalComposite(toBreak.toArray(new Goal[0])));
+        }
         if (!toPlace.isEmpty()) {
             return new JankyGoalComposite(new GoalComposite(toPlace.toArray(new Goal[0])), new GoalComposite(toBreak.toArray(new Goal[0])));
         }
@@ -859,13 +958,48 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         }
     }
 
+    private Map<Direction, BlockState> mapBlocksAround(BlockStateInterface bsi, BetterBlockPos pos){
+        Map<Direction, BlockState> blocksAround = new HashMap<>();
+        blocksAround.put(Direction.UP, bsi.get0(pos.above()));
+        blocksAround.put(Direction.DOWN, bsi.get0(pos.below()));
+        blocksAround.put(Direction.EAST, bsi.get0(pos.east()));
+        blocksAround.put(Direction.WEST, bsi.get0(pos.west()));
+        blocksAround.put(Direction.SOUTH, bsi.get0(pos.south()));
+        blocksAround.put(Direction.NORTH, bsi.get0(pos.north()));
+        return blocksAround;
+    }
+
+    private Goal specialPlacementGoal(BuilderCalculationContext bcc ,BlockState state, BetterBlockPos pos){
+        Map<Direction, BlockState> blocksAround = mapBlocksAround(bcc.bsi, pos);
+        Map<String, String> properties = BlockPlacementAnalyzer.mapProperties(state);
+
+        Goal shortestSpecialGoal = getSpecialGoalFromFacingAndHalfProp(blocksAround, state, pos, bcc, properties);
+        if (shortestSpecialGoal != null) {
+            return shortestSpecialGoal;
+        }
+        shortestSpecialGoal = getSpecialGoalFromSlabType(blocksAround, state, pos, bcc.bsi, properties.getOrDefault("type", ""));
+        if (shortestSpecialGoal != null){
+            return shortestSpecialGoal;
+        }
+        shortestSpecialGoal = getSpecialGoalFromAxisProp(blocksAround, state, pos, bcc, properties.getOrDefault("axis", ""));
+        if (shortestSpecialGoal != null) {
+            return shortestSpecialGoal;
+        }
+        shortestSpecialGoal = getSpecialGoalFromDirProp(blocksAround, state, pos, bcc, properties);
+        return shortestSpecialGoal;
+    }
+
     private Goal placementGoal(BlockPos pos, BuilderCalculationContext bcc) {
+        return placementGoal(pos, bcc, Movement.HORIZONTALS_BUT_ALSO_DOWN_____SO_EVERY_DIRECTION_EXCEPT_UP);
+    }
+
+    private Goal placementGoal(BlockPos pos, BuilderCalculationContext bcc, Direction[] facings) {
         if (!(ctx.world().getBlockState(pos).getBlock() instanceof AirBlock)) {  // TODO can this even happen?
             return new GoalPlace(pos);
         }
         boolean allowSameLevel = !(ctx.world().getBlockState(pos.above()).getBlock() instanceof AirBlock);
         BlockState current = ctx.world().getBlockState(pos);
-        for (Direction facing : Movement.HORIZONTALS_BUT_ALSO_DOWN_____SO_EVERY_DIRECTION_EXCEPT_UP) {
+        for (Direction facing : facings) {
             //noinspection ConstantConditions
             if (MovementHelper.canPlaceAgainst(ctx, pos.relative(facing)) && placementPlausible(pos, bcc.getSchematic(pos.getX(), pos.getY(), pos.getZ(), current))) {
                 return new GoalAdjacent(pos, pos.relative(facing), allowSameLevel);
@@ -982,6 +1116,697 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         }
     }
 
+    private Direction[] getDirectionsFromAxis(Direction.Axis axis){
+        switch (axis){
+            case X -> {
+                return new Direction[] {Direction.EAST, Direction.WEST};
+            }
+            case Y -> {
+                return new Direction[] {Direction.UP, Direction.DOWN};
+            }
+            case Z -> {
+                return new Direction[] {Direction.NORTH, Direction.SOUTH};
+            }
+            default -> throw new Error("Invalid Axis");
+        }
+    }
+
+    private Set<BetterBlockPos> getPossiblePosToBe(BlockStateInterface bsi, Map<Direction, Vec3> centerToAim, @Nullable Direction playerFacing, BetterBlockPos origin){
+        // get possible position for the player to be for posing a special block (with the head as origin)
+        Set<BetterBlockPos> possibleBlocksToBe = new LinkedHashSet<>();
+        for (Map.Entry<Direction, Vec3> posToAim : centerToAim.entrySet()){
+            ProjectedToPlaceHemisphere toPlace = new ProjectedToPlaceHemisphere(bsi, playerFacing, posToAim.getKey().getOpposite(), posToAim.getValue(), (float) ctx.playerController().getBlockReachDistance() - 0.5f);
+            possibleBlocksToBe.addAll(toPlace.createShape());
+        }
+        possibleBlocksToBe.remove(origin); // do not add the position of the block to place
+        return possibleBlocksToBe;
+    }
+
+    private Goal getShortestGoal(Set<BetterBlockPos> possibleBlocksToBe){
+        // get the shortest goal for the player to be for posing a special block
+        Goal shortestGoal = null;
+        double bestHeuristic = Double.MAX_VALUE;
+        for (BetterBlockPos blockToBe : possibleBlocksToBe){
+            Goal goalToBe = new GoalBlock(blockToBe.below());
+            if (goalToBe.heuristic() < bestHeuristic){
+                shortestGoal = goalToBe;
+                bestHeuristic = goalToBe.heuristic();
+            }
+        }
+        return shortestGoal;
+    }
+
+    private Goal getSpecialGoalFromFacingAndHalfProp(Map<Direction, BlockState> blocksAround, BlockState state, BetterBlockPos pos, BuilderCalculationContext bcc, Map<String, String> properties){
+        Pair<Map<Direction, Vec3>, Direction> specialPoint = getSpecialPointFromFacingAndHalfProp(blocksAround, state, pos, properties);
+        if (specialPoint.first().isEmpty()){
+            return null;
+        }
+        return getShortestGoal(getPossiblePosToBe(bcc.bsi, specialPoint.first(), specialPoint.second(), pos));
+    }
+
+    private static Map<Direction, Boolean> createDirectionPropertyLinker(Map<String, String> properties){
+        Map<Direction, Boolean> directionPropertyLinker = new LinkedHashMap<>();
+        for (Direction dir : Direction.values()){
+            if (properties.containsKey(dir.toString())){
+                directionPropertyLinker.put(dir, Boolean.parseBoolean(properties.get(dir.toString())));
+            }
+        }
+        return directionPropertyLinker;
+    }
+
+    private Goal getSpecialGoalFromAxisProp(Map<Direction, BlockState> blocksAround, BlockState state, BetterBlockPos pos, BuilderCalculationContext bcc, String axisStr){
+        if (axisStr.isEmpty()){ return null; }
+
+        Direction.Axis axis =  Arrays.stream(Direction.Axis.values())
+                .filter(h -> h.getSerializedName().equalsIgnoreCase(axisStr))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("Invalid axis: " + axisStr));
+
+        BlockPlacementBehavior facingMode = BlockPlacementAnalyzer.getAxisProperty(state.getBlock());
+        Map<Direction, Vec3> specialPoints = getSpecialPointFromAxisProp(blocksAround, facingMode, pos, axis);
+        Set<BetterBlockPos> possibleBlockToBe = new LinkedHashSet<>();
+
+        switch (facingMode){
+            case FACES_PLAYER -> {
+                for (Direction dir : getDirectionsFromAxis(axis)){
+                    possibleBlockToBe.addAll(getPossiblePosToBe(bcc.bsi, specialPoints, dir, pos));
+                }
+            }
+            case FACES_SAME_AS_HIT_FACE -> possibleBlockToBe.addAll(getPossiblePosToBe(bcc.bsi, specialPoints, null, pos));
+        }
+        return getShortestGoal(possibleBlockToBe);
+    }
+
+    private Goal getSpecialGoalFromSlabType(Map<Direction, BlockState> blocksAround, BlockState state, BetterBlockPos pos, BlockStateInterface bsi, String typeStr){
+        Map<Direction, Vec3> specialPoints = getSpecialPointFromSlabType(blocksAround, state, pos, typeStr);
+        if (specialPoints.isEmpty()){
+            return null;
+        }
+        return getShortestGoal(getPossiblePosToBe(bsi, specialPoints, null, pos));
+    }
+
+    private Goal getSpecialGoalFromDirProp(Map<Direction, BlockState> blocksAround, BlockState state, BetterBlockPos pos, BuilderCalculationContext bcc, Map<String, String> props){
+
+        Map<Direction, Boolean> directionPropertyLinker = createDirectionPropertyLinker(props);
+        if (directionPropertyLinker.isEmpty()){
+            return null;
+        }
+        BlockPlacementBehavior facingMode = BlockPlacementAnalyzer.getDirectionProperty(state.getBlock());
+
+        Map<Direction, Vec3> centerToPlace = new LinkedHashMap<>();
+
+
+
+        switch (facingMode){
+            case FACES_OPPOSITE_FROM_HIT_FACE -> {
+                for (Map.Entry<Direction, Boolean> link : directionPropertyLinker.entrySet()){
+                    Direction dir = link.getKey();
+                    if (blocksAround.get(dir).isAir() || blocksAround.get(dir).getMaterial().isLiquid()){
+                        continue;
+                    }
+                    if (link.getValue()){
+                        centerToPlace.put(dir, pos.getCenter().add(new Vec3(dir.getNormal().getX(), dir.getNormal().getY(), dir.getNormal().getZ()).scale(0.51)));
+                    }
+                }
+            }
+            case CONNECTS_TO_NEIGHBORS -> {
+                if (bcc.bsi.get0(pos).getBlock().equals(state.getBlock())){
+                    return null;
+                }
+                return placementGoal(pos, bcc, new Direction[]{Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST});
+            }
+            default -> throw new Error("(getSpecialGoalVecFromAxisProp) facingMode value is invalid, block: " + state.getBlock().toString() + " at: " + pos.toString() + " facingMode is : " + facingMode);
+        }
+
+        return getShortestGoal(getPossiblePosToBe(bcc.bsi, centerToPlace, null, pos));
+    }
+
+    private Pair<Map<Direction, Vec3>, Direction> getSpecialPointFromFacingAndHalfProp(Map<Direction, BlockState> blocksAround, BlockState state, BetterBlockPos pos, Map<String, String> properties){
+        // determine a goal to place the player where he can pos the block depending on its facing and half properties
+        String facingStr = properties.getOrDefault("facing", "");
+        String halfStr = properties.getOrDefault("half", "");
+
+        if (facingStr.isEmpty() && halfStr.isEmpty()){
+            return new Pair<>(new LinkedHashMap<>(), null);
+        }
+        Direction playerFacing = null;
+        Map<Direction, Vec3> centerToPlace = new LinkedHashMap<>();
+
+        if (!facingStr.isEmpty()){
+            Direction facing = Direction.byName(facingStr);
+            assert facing != null;
+            BlockPlacementBehavior facingMode = BlockPlacementAnalyzer.getFacingProperty(state.getBlock());
+            switch (facingMode){
+                case FACES_SAME_AS_HIT_FACE -> centerToPlace.put(facing, pos.getCenter().add(new Vec3(facing.getNormal().getX(), facing.getNormal().getY(), facing.getNormal().getZ()).scale(0.51)));
+                case FACES_PLAYER -> {
+                    for (Direction dir : Direction.values()){
+                        if (blocksAround.get(dir).isAir() || blocksAround.get(dir).getMaterial().isLiquid()){
+                            continue;
+                        }
+                        centerToPlace.put(dir, pos.getCenter().add(new Vec3(dir.getNormal().getX(), dir.getNormal().getY(), dir.getNormal().getZ()).scale(0.51)));
+                    }
+                    centerToPlace.remove(facing);
+                    playerFacing = facing.getOpposite();
+                }
+                case FACES_AWAY_FROM_PLAYER -> {
+                    for (Direction dir : Direction.values()){
+                        if (blocksAround.get(dir).isAir() || blocksAround.get(dir).getMaterial().isLiquid()){
+                            continue;
+                        }
+                        centerToPlace.put(dir, pos.getCenter().add(new Vec3(dir.getNormal().getX(), dir.getNormal().getY(), dir.getNormal().getZ()).scale(0.51)));
+                    }
+                    centerToPlace.remove(facing.getOpposite());
+                    playerFacing = facing;
+                }
+                default -> throw new Error("(specialPlacementGoal) Block facing invalid");
+            }
+        } else {
+            for (Direction dir : Direction.Plane.HORIZONTAL){
+                if (blocksAround.get(dir).isAir() || blocksAround.get(dir).getMaterial().isLiquid()){
+                    continue;
+                }
+                centerToPlace.put(dir, pos.getCenter().add(new Vec3(dir.getNormal().getX(), dir.getNormal().getY(), dir.getNormal().getZ()).scale(0.51)));
+            }
+
+        }
+        centerToPlace = modSpecialGoalVecFromHalfProp(centerToPlace, halfStr);
+        return new Pair<>(centerToPlace, playerFacing);
+    }
+
+    private Map<Direction, Vec3> modSpecialGoalVecFromHalfProp(Map<Direction, Vec3> centerToAim, String halfStr){
+        if (halfStr.isEmpty()){ return centerToAim; }
+
+        Map<Direction, Vec3> centerToPlace = new HashMap<>(centerToAim);
+
+        switch (halfStr){
+            case "top" -> {
+                centerToPlace.remove(Direction.DOWN);
+                for (Direction dir : Direction.Plane.HORIZONTAL){
+                    if (centerToPlace.containsKey(dir)){
+                        centerToPlace.replace(dir, centerToPlace.get(dir).add(0, 0.25, 0));
+                    }
+                }
+            }
+            case "bottom" -> {
+                centerToPlace.remove(Direction.UP);
+                for (Direction dir : Direction.Plane.HORIZONTAL){
+                    if (centerToPlace.containsKey(dir)){
+                        centerToPlace.replace(dir, centerToPlace.get(dir).add(0, -0.25, 0));
+                    }
+                }
+            }
+        }
+        return centerToPlace;
+    }
+
+    private Map<Direction, Vec3> getSpecialPointFromAxisProp(Map<Direction, BlockState> blocksAround, BlockPlacementBehavior facingMode, BetterBlockPos pos, Direction.Axis axis){
+        // determine a goal to place the player where he can pos the block depending on its axis property
+
+        Map<Direction, Vec3> centerToPlace = new LinkedHashMap<>();
+        switch (facingMode){
+            case FACES_PLAYER -> {
+                for (Direction dir : Direction.values()){
+                    if (blocksAround.get(dir).isAir() || blocksAround.get(dir).getMaterial().isLiquid()){
+                        continue;
+                    }
+                    centerToPlace.put(dir, pos.getCenter().add(new Vec3(dir.getNormal().getX(), dir.getNormal().getY(), dir.getNormal().getZ()).scale(0.51)));
+                }
+            }
+            case FACES_SAME_AS_HIT_FACE -> {
+                for (Direction dir : axis.getPlane()){
+                    if (!axis.equals(dir.getAxis()) || blocksAround.get(dir).isAir() || blocksAround.get(dir).getMaterial().isLiquid()){
+                        continue;
+                    }
+                    centerToPlace.put(dir, pos.getCenter().add(new Vec3(dir.getNormal().getX(), dir.getNormal().getY(), dir.getNormal().getZ()).scale(0.51)));
+                }
+            }
+            default -> throw new Error("(getSpecialGoalVecFromAxisProp) facingMode value is invalid");
+        }
+        return centerToPlace;
+    }
+
+    private Map<Direction, Vec3> getSpecialPointFromSlabType(Map<Direction, BlockState> blocksAround, BlockState state, BetterBlockPos pos, String typeStr){
+        // determine a goal to place the player where he can pos the block depending on its directional (north, east, south, west, up, down) properties
+        Map<Direction, Vec3> centerToPlace = new LinkedHashMap<>();
+        if (typeStr.isEmpty()){ return centerToPlace; }
+
+        switch (typeStr){
+            case "top" -> {
+                for (Direction dir : Direction.values()){
+                    if (blocksAround.get(dir).isAir() || blocksAround.get(dir).getMaterial().isLiquid()) { continue; }
+                    centerToPlace.put(dir, pos.getCenter().add(new Vec3(dir.getNormal().getX(), dir.getNormal().getY(), dir.getNormal().getZ()).scale(0.51)).add(0,0.25,0));
+                }
+                centerToPlace.remove(Direction.DOWN);
+            }
+            case "bottom" -> {
+                for (Direction dir : Direction.values()){
+                    if (blocksAround.get(dir).isAir() || blocksAround.get(dir).getMaterial().isLiquid()) { continue; }
+                    centerToPlace.put(dir, pos.getCenter().add(new Vec3(dir.getNormal().getX(), dir.getNormal().getY(), dir.getNormal().getZ()).scale(0.51)).add(0,-0.25,0));
+                }
+                centerToPlace.remove(Direction.UP);
+            }
+            case "double" -> {
+                Optional<SlabType> actualType = state.getOptionalValue(BlockStateProperties.SLAB_TYPE);
+                if (actualType.isEmpty()){
+                    for (Direction dir : Direction.Plane.HORIZONTAL){
+                        if (blocksAround.get(dir).isAir() || blocksAround.get(dir).getMaterial().isLiquid()) { continue; }
+                        centerToPlace.put(dir, pos.getCenter().add(new Vec3(dir.getNormal().getX(), dir.getNormal().getY(), dir.getNormal().getZ()).scale(0.51)).add(0,-0.25,0));
+                    }
+                } else {
+                    switch (actualType.get()){
+                        case TOP -> {
+                            for (Direction dir : Direction.Plane.HORIZONTAL){
+                                if (blocksAround.get(dir).isAir() || blocksAround.get(dir).getMaterial().isLiquid()) { continue; }
+                                centerToPlace.put(dir, pos.getCenter().add(new Vec3(dir.getNormal().getX(), dir.getNormal().getY(), dir.getNormal().getZ()).scale(0.51)).add(0,-0.25,0));
+                            }
+                            Direction dir = Direction.UP;
+                            centerToPlace.put(dir, pos.getCenter());
+                        }
+                        case BOTTOM -> {
+                            for (Direction dir : Direction.Plane.HORIZONTAL){
+                                if (blocksAround.get(dir).isAir() || blocksAround.get(dir).getMaterial().isLiquid()) { continue; }
+                                centerToPlace.put(dir, pos.getCenter().add(new Vec3(dir.getNormal().getX(), dir.getNormal().getY(), dir.getNormal().getZ()).scale(0.51)).add(0,0.25,0));
+                            }
+                            Direction dir = Direction.DOWN;
+                            centerToPlace.put(dir, pos.getCenter());
+                        }
+                        default -> throw new Error("invalid current slab type");
+                    }
+                }
+            }
+        }
+        return centerToPlace;
+    }
+
+    private static class ProjectedToPlaceHemisphere{
+        BlockStateInterface bsi;
+        private final float radius;
+        private final Vec3 center;
+        private final Direction directionToFaceAsPlayer;
+        private final Direction directionOfBlockFaceToHit;
+        private final BetterBlockPos blockToHitPos;
+        private final List<BetterBlockPos> blocksInSphere = new ArrayList<>();
+
+        /**
+         * Create an instance of this class
+         * <p>
+         * make a projected hemisphere of where the player can be to place a block.
+         * <p/>
+         *
+         *
+         * @param bsi                           the block state interface for real world data
+         * @param directionToFace               The direction the player has to face
+         * @param directionOfBlockFaceToHit     The face the ray has to hit
+         * @param PointToHit                    Position of the point to hit as the player
+         * @param radius                        The length of the player look ray
+         */
+        ProjectedToPlaceHemisphere(BlockStateInterface bsi, @Nullable Direction directionToFace, @Nullable Direction directionOfBlockFaceToHit, Vec3 PointToHit, float radius){
+            // the center need to be in the block to hit ideally close to the face to hit
+            this.bsi = bsi;
+            this.radius = radius;
+            this.directionToFaceAsPlayer = directionToFace;
+            this.directionOfBlockFaceToHit = directionOfBlockFaceToHit;
+            this.blockToHitPos = new BetterBlockPos(PointToHit.x, PointToHit.y, PointToHit.z);
+            this.center = PointToHit;
+        }
+
+        public List<BetterBlockPos> createShape(){
+            // should be slower but keeping it because I'm not sure
+            float minX = -radius;
+            float minY = -radius;
+            float minZ = -radius;
+            float maxX = radius;
+            float maxY = radius;
+            //float maxY = Baritone.settings().buildInLayers.value ? Math.min(layer + origin.getY() - blockToHitPos.getY() + 2, radius) : radius;
+            float maxZ = radius;
+
+            if (directionOfBlockFaceToHit != null){
+                switch (directionOfBlockFaceToHit){
+                    case UP -> minY = 0;
+                    case DOWN -> maxY = 0;
+                    case EAST -> minX = 0;
+                    case WEST -> maxX = 0;
+                    case SOUTH -> minZ = 0;
+                    case NORTH -> maxZ = 0;
+                    default -> throw new Error("(ProjectedHemisphere.createShape) Invalid direction");
+                }
+            }
+
+            Function<Vec3, Boolean> isFacingOK;
+            if (directionToFaceAsPlayer == null){
+                isFacingOK = vec -> true;
+            } else {
+                switch (directionToFaceAsPlayer){
+                    case UP -> maxY = 0;
+                    case DOWN -> minY = 0;
+                    case EAST -> maxX = 0;
+                    case WEST -> minX = 0;
+                    case SOUTH -> maxZ = 0;
+                    case NORTH -> minZ = 0;
+                }
+
+                Direction.Axis axisAsPlayer = directionToFaceAsPlayer.getAxis();
+                switch (axisAsPlayer){
+                    case X -> isFacingOK = vec -> Math.abs(vec.x) > Math.max(Math.abs(vec.y), Math.abs(vec.z));
+                    case Y -> isFacingOK = vec -> Math.abs(vec.y) > Math.max(Math.abs(vec.x), Math.abs(vec.z));
+                    case Z -> isFacingOK = vec -> Math.abs(vec.z) > Math.max(Math.abs(vec.x), Math.abs(vec.y));
+                    default -> throw new IllegalStateException("(ProjectedHemisphere.createShape) Invalid Axis");
+                }
+            }
+
+            for (float x = minX; x <= maxX; x++) {
+                double WorldX = x + center.x;
+                for (float y = minY; y <= maxY; y++) {
+                    double WorldY = y + center.y;
+                    for (float z = minZ; z <= maxZ; z++) {
+                        double WorldZ = z + center.z;
+                        if (center.distanceToSqr(WorldX, WorldY, WorldZ) > radius * radius){
+                            continue;
+                        }
+                        BetterBlockPos pos = new BetterBlockPos(WorldX, WorldY, WorldZ);
+                        Vec3 blockToCenter = center.add(pos.getCenter().reverse());
+                        if (!isFacingOK.apply(blockToCenter)){
+                            continue;
+                        }
+                        BlockHitResult hit = new BlockRaycast(bsi ,pos.getCenter(), blockToCenter, 0.001).rayCastFirstOccurrence(true);
+                        if (hit == null){
+                            throw new Error("no block hit, start : " + pos.getCenter() + ", end : " + center);
+                        }
+                        if (hit.getDirection().equals(directionOfBlockFaceToHit) && hit.getBlockPos().equals(blockToHitPos)){
+                            blocksInSphere.add(pos);
+                        }
+
+                    }
+                }
+            }
+            return blocksInSphere;
+        }
+
+        private List<BetterBlockPos> shapeWithoutRayCast(){
+            List<BetterBlockPos> result = new ArrayList<>();
+            float minX = -radius;
+            float minY = -radius;
+            float minZ = -radius;
+            float maxX = radius;
+            float maxY = radius;
+            float maxZ = radius;
+            Function<Vec3, Boolean> isFacingOK;
+
+            if (directionOfBlockFaceToHit != null){
+                switch (directionOfBlockFaceToHit){
+                    case UP -> minY = 0;
+                    case DOWN -> maxY = 0;
+                    case EAST -> minX = 0;
+                    case WEST -> maxX = 0;
+                    case SOUTH -> minZ = 0;
+                    case NORTH -> maxZ = 0;
+                    default -> throw new Error("(ProjectedHemisphere.shapeWithoutRayCast) Invalid direction");
+                }
+            }
+
+            if (directionToFaceAsPlayer == null){
+                isFacingOK = vec -> true;
+            } else {
+                switch (directionToFaceAsPlayer){
+                    case UP -> maxY = 0;
+                    case DOWN -> minY = 0;
+                    case EAST -> maxX = 0;
+                    case WEST -> minX = 0;
+                    case SOUTH -> maxZ = 0;
+                    case NORTH -> minZ = 0;
+                }
+
+                Direction.Axis axisAsPlayer = directionToFaceAsPlayer.getAxis();
+                switch (axisAsPlayer){
+                    case X -> isFacingOK = vec -> Math.abs(vec.x) > Math.max(Math.abs(vec.y), Math.abs(vec.z));
+                    case Y -> isFacingOK = vec -> Math.abs(vec.y) > Math.max(Math.abs(vec.x), Math.abs(vec.z));
+                    case Z -> isFacingOK = vec -> Math.abs(vec.z) > Math.max(Math.abs(vec.x), Math.abs(vec.y));
+                    default -> throw new IllegalStateException("(ProjectedHemisphere.createShape) Invalid Axis");
+                }
+            }
+
+            for (float x = minX; x <= maxX; x++) {
+                double WorldX = x + center.x;
+                for (float y = minY; y <= maxY; y++) {
+                    double WorldY = y + center.y;
+                    for (float z = minZ; z <= maxZ; z++) {
+                        double WorldZ = z + center.z;
+                        if (center.distanceToSqr(WorldX, WorldY, WorldZ) > radius * radius){
+                            continue;
+                        }
+                        Vec3 blockToCenter = new Vec3(center.x - WorldX, center.y - WorldY, center.z - WorldZ);
+                        if (!isFacingOK.apply(blockToCenter)){
+                            continue;
+                        }
+                        result.add(new BetterBlockPos(WorldX, WorldY, WorldZ));
+                    }
+                }
+            }
+            return result;
+        }
+
+        public List<BetterBlockPos> getBlocksInSphere() {
+            return blocksInSphere;
+        }
+
+        public float getRadius() {
+            return radius;
+        }
+
+        public Vec3 getCenter() {
+            return center;
+        }
+    }
+
+    private static class BlockRaycast{
+        BlockStateInterface bsi;
+        public double stepSize;
+        private final Vec3 start;
+        private final Vec3 normalRay;
+        private final double sqrLength;
+
+        BlockRaycast(BlockStateInterface bsi, Vec3 start, Vec3 ray, double stepSize, double length){
+            this.bsi = bsi;
+            this.stepSize = stepSize;
+            this.start = start;
+            this.normalRay = ray.normalize();
+            this.sqrLength = length * length;
+        }
+
+        BlockRaycast(BlockStateInterface bsi, Vec3 start, Vec3 ray, double stepSize){
+            this.bsi = bsi;
+            this.stepSize = stepSize;
+            this.start = start;
+            this.normalRay = ray.normalize();
+            this.sqrLength = ray.lengthSqr();
+        }
+
+        BlockRaycast(BlockStateInterface bsi, Vec3 start, Vec3 ray){
+            this.bsi = bsi;
+            this.stepSize = 0.1;
+            this.start = start;
+            this.normalRay = ray.normalize();
+            this.sqrLength = ray.lengthSqr();
+        }
+
+        private static BlockHitResult getBlockHitResult(Vec3 collisionPoint, BetterBlockPos blockPos, double precision){
+            Direction direction;
+
+            Vec3 blockCenter = blockPos.getCenter();
+            Vec3 centerToStep = collisionPoint.add(blockCenter.reverse());
+            double[] absoluteVectorValues = {Math.abs(centerToStep.x) , Math.abs(centerToStep.y), Math.abs(centerToStep.z)};
+            Tuple<Double, Integer> greatestValue = new Tuple<>(0.0,-1);
+            for (int i = 0; i < 3; i++) {
+                if (absoluteVectorValues[i] > greatestValue.getA()){
+                    greatestValue = new Tuple<>(absoluteVectorValues[i], i);
+                }
+            }
+            direction = switch (greatestValue.getB()){
+                case -1 -> Direction.DOWN; // normally impossible
+                case 0 -> (centerToStep.x < 0) ? Direction.WEST : Direction.EAST;
+                case 1 -> (centerToStep.y < 0) ? Direction.DOWN : Direction.UP;
+                case 2 -> (centerToStep.z < 0) ? Direction.NORTH : Direction.SOUTH;
+                default -> throw new Error("Impossible case in switch statement");
+            };
+            boolean isInside = greatestValue.getA() < 0.5 - precision;
+
+            return new BlockHitResult(collisionPoint, direction, blockPos, isInside);
+        }
+
+        public BlockHitResult rayCastFirstOccurrence(boolean ignoreLiquid){
+            return rayCastFirstOccurrence(this, ignoreLiquid);
+        }
+
+        public static BlockHitResult rayCastFirstOccurrence(BlockRaycast raycast, boolean ignoreLiquid){
+            double step = 0;
+            Vec3 normalizedRay = raycast.normalRay;
+
+            boolean isXPositive = normalizedRay.x > 0;
+            boolean isYPositive = normalizedRay.y > 0;
+            boolean isZPositive = normalizedRay.z > 0;
+
+            boolean isXNegative = normalizedRay.x < 0;
+            boolean isYNegative = normalizedRay.y < 0;
+            boolean isZNegative = normalizedRay.z < 0;
+
+            int recursion = 0;
+            while (step*step < raycast.sqrLength && recursion < 10000){
+                recursion++;
+
+                Vec3 currentPoint = raycast.start.add(normalizedRay.scale(step));
+                double nextXStep = Double.MAX_VALUE;
+                double nextYStep = Double.MAX_VALUE;
+                double nextZStep = Double.MAX_VALUE;
+
+                if (isXPositive){
+                    nextXStep = (Math.ceil(currentPoint.x) - raycast.start.x)/normalizedRay.x;
+                } else if (isXNegative) {
+                    nextXStep = (Math.floor(currentPoint.x) - raycast.start.x)/normalizedRay.x;
+                }
+                if (isYPositive){
+                    nextYStep = (Math.ceil(currentPoint.y) - raycast.start.y)/normalizedRay.y;
+                } else if (isYNegative) {
+                    nextYStep = (Math.floor(currentPoint.y) - raycast.start.y)/normalizedRay.y;
+                }
+                if (isZPositive){
+                    nextZStep = (Math.ceil(currentPoint.z) - raycast.start.z)/normalizedRay.z;
+                } else if (isZNegative) {
+                    nextZStep = (Math.floor(currentPoint.z) - raycast.start.z)/normalizedRay.z;
+                }
+                double smallestNextStep = Math.min(Math.min(nextXStep, nextYStep), nextZStep);
+
+                if (smallestNextStep > step){
+                    step = smallestNextStep + raycast.stepSize;
+                } else {
+                    throw new ArithmeticException("(optimizedRayCastFirstOccurrence) Next step is smaller than current step");
+                }
+                BetterBlockPos currentBlockPos = new BetterBlockPos(currentPoint.x, currentPoint.y, currentPoint.z);
+                BlockState currentBlock = raycast.bsi.get0(currentBlockPos);
+                if (currentBlock.isAir()){
+                    continue;
+                }
+                Optional<SlabType> type = currentBlock.getOptionalValue(BlockStateProperties.SLAB_TYPE);
+                if (type.isPresent()){
+                    Vec3 BlockCenter = currentBlockPos.getCenter();
+                    switch (type.get()){
+                        case TOP -> { if (currentPoint.y() < BlockCenter.y() && raycast.start.add(normalizedRay.scale(smallestNextStep)).y() < BlockCenter.y()) { continue; } }
+                        case BOTTOM -> { if (currentPoint.y() > BlockCenter.y() && raycast.start.add(normalizedRay.scale(smallestNextStep)).y() > BlockCenter.y()) { continue; } }
+                    }
+                }
+                if (currentBlock.is(Blocks.WATER) || currentBlock.is(Blocks.LAVA)){
+                    if (ignoreLiquid){
+                        continue;
+                    } else {
+                        return getBlockHitResult(currentPoint, currentBlockPos, raycast.stepSize*2);
+                    }
+                }
+                return getBlockHitResult(currentPoint, currentBlockPos, raycast.stepSize*2);
+            }
+            return null;
+        }
+
+        public Tuple<Optional<BlockHitResult>, List<BetterBlockPos>[]> customRayCast(Set<BetterBlockPos> blocksToIgnore, boolean ignoreLiquid){
+            return customRayCast(this, blocksToIgnore, ignoreLiquid);
+        }
+
+        public static Tuple<Optional<BlockHitResult>, List<BetterBlockPos>[]> customRayCast(BlockRaycast raycast,
+                                                                                            Set<BetterBlockPos> blocksToIgnore,
+                                                                                            boolean ignoreLiquid){
+            // returns a Tuple of 2 element The first one is the blockHitResult of the first block that was hit
+            // and the second is an array of 2 lists the first is the blocks before the hit and the second is the blocks after the hit
+
+            Vec3 normalizedRay = raycast.normalRay;
+            List<BetterBlockPos> blocksBeforeFirstOccurrence = new ArrayList<>();
+            BlockHitResult blockHit = null;
+            List<BetterBlockPos> blocksAfterFirstOccurrence = new ArrayList<>();
+
+            double step = 0;
+
+            boolean isXPositive = normalizedRay.x > 0;
+            boolean isYPositive = normalizedRay.y > 0;
+            boolean isZPositive = normalizedRay.z > 0;
+
+            boolean isXNegative = normalizedRay.x < 0;
+            boolean isYNegative = normalizedRay.y < 0;
+            boolean isZNegative = normalizedRay.z < 0;
+
+            int recursion = 0;
+            while (step*step < raycast.sqrLength && recursion < 10000){
+                recursion++;
+                Vec3 currentRelativePoint = normalizedRay.scale(step);
+                Vec3 currentPoint = raycast.start.add(currentRelativePoint);
+                double nextXStep = Double.MAX_VALUE;
+                double nextYStep = Double.MAX_VALUE;
+                double nextZStep = Double.MAX_VALUE;
+
+                if (isXPositive){
+                    nextXStep = (Math.ceil(currentPoint.x) - raycast.start.x)/normalizedRay.x;
+                } else if (isXNegative) {
+                    nextXStep = (Math.floor(currentPoint.x) - raycast.start.x)/normalizedRay.x;
+                }
+                if (isYPositive){
+                    nextYStep = (Math.ceil(currentPoint.y) - raycast.start.y)/normalizedRay.y;
+                } else if (isYNegative) {
+                    nextYStep = (Math.floor(currentPoint.y) - raycast.start.y)/normalizedRay.y;
+                }
+                if (isZPositive){
+                    nextZStep = (Math.ceil(currentPoint.z) - raycast.start.z)/normalizedRay.z;
+                } else if (isZNegative) {
+                    nextZStep = (Math.floor(currentPoint.z) - raycast.start.z)/normalizedRay.z;
+                }
+                double smallestNextStep = Math.min(Math.min(nextXStep, nextYStep), nextZStep);
+
+                if (smallestNextStep > step){
+                    step = smallestNextStep + raycast.stepSize;
+                } else {
+                    throw new ArithmeticException("(optimizedRayCastFirstOccurence) Next step is smaller than current step");
+                }
+                BetterBlockPos currentBlockPos = new BetterBlockPos(currentPoint.x, currentPoint.y, currentPoint.z);
+                if (blocksToIgnore.contains(currentBlockPos)){
+                    continue;
+                }
+                if (blockHit != null) {
+                    blocksAfterFirstOccurrence.add(currentBlockPos);
+                    continue;
+                }
+                BlockState currentBlock = raycast.bsi.get0(currentBlockPos);
+                if (currentBlock.isAir()){
+                    blocksBeforeFirstOccurrence.add(currentBlockPos);
+                    continue;
+                }
+                Optional<SlabType> type = currentBlock.getOptionalValue(BlockStateProperties.SLAB_TYPE);
+                if (type.isPresent()){
+                    Vec3 BlockCenter = currentBlockPos.getCenter();
+                    switch (type.get()){
+                        case TOP -> { if (currentPoint.y() < BlockCenter.y() && normalizedRay.scale(smallestNextStep).y() < BlockCenter.y()) {
+                            blocksBeforeFirstOccurrence.add(currentBlockPos);
+                            continue;
+                        } }
+                        case BOTTOM -> { if (currentPoint.y() > BlockCenter.y() && normalizedRay.scale(smallestNextStep).y() > BlockCenter.y()) {
+                            blocksBeforeFirstOccurrence.add(currentBlockPos);
+                            continue;
+                        } }
+                    }
+                }
+                if (currentBlock.is(Blocks.WATER) || currentBlock.is(Blocks.LAVA)){
+                    if (ignoreLiquid){
+                        blocksBeforeFirstOccurrence.add(currentBlockPos);
+                        continue;
+                    }
+                }
+                blockHit = getBlockHitResult(currentPoint, currentBlockPos, raycast.stepSize*2);
+            }
+            return new Tuple<>(Optional.ofNullable(blockHit), new List[]{blocksBeforeFirstOccurrence, blocksAfterFirstOccurrence});
+        }
+
+        public Tuple<Optional<BlockHitResult>, List<BetterBlockPos>[]> rayCastMultipleOccurrenceWithAir(BlockStateInterface bsi, boolean ignoreLiquid){
+            // returns a Tuple of 2 element The first one is the blockHitResult of the first block that was hit
+            // and the second is an array of 2 lists the first is the blocks before the hit and the second is the blocks after the hit
+
+            return customRayCast(new HashSet<>(), ignoreLiquid);
+        }
+    }
+
     @Override
     public void onLostControl() {
         incorrectPositions = null;
@@ -1023,6 +1848,11 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                 result.add(Blocks.AIR.defaultBlockState());
                 continue;
             }
+            BlockState itemDefaultState = ((BlockItem) stack.getItem()).getBlock().defaultBlockState();
+            if (!itemDefaultState.getProperties().isEmpty()){
+                result.add(itemDefaultState);
+                continue;
+            }
             // <toxic cloud>
             BlockState itemState = ((BlockItem) stack.getItem())
                 .getBlock()
@@ -1039,6 +1869,15 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             // </toxic cloud>
         }
         return result;
+    }
+
+    private static boolean approxPlaceableContainsBlockType(Collection<BlockState> states, Block block){
+        for (BlockState state : states) {
+            if (block.equals(state.getBlock())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean sameBlockstate(BlockState first, BlockState second) {
@@ -1095,6 +1934,85 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         }
         if (current.equals(desired)) {
             return true;
+        }
+        if (current.getBlock().equals(desired.getBlock())){
+            Map<String, String> currProperties = BlockPlacementAnalyzer.mapProperties(current);
+            if (currProperties.isEmpty()){
+                return sameBlockstate(current, desired);
+            }
+            Map<Direction, Boolean> linker = createDirectionPropertyLinker(currProperties);
+            if (linker.isEmpty()){
+                return sameBlockstate(current,desired);
+            }
+            BlockPlacementBehavior placementBehavior = BlockPlacementAnalyzer.getDirectionProperty(current.getBlock());
+            if (placementBehavior == BlockPlacementBehavior.CONNECTS_TO_NEIGHBORS){
+                return true;
+            }
+        }
+
+        return sameBlockstate(current, desired);
+    }
+
+    private static boolean itemApproxValid(BlockState current, BlockState desired, boolean itemVerify) {
+        if (desired == null) {
+            return true;
+        }
+        if (current.getBlock() instanceof LiquidBlock && Baritone.settings().okIfWater.value) {
+            return true;
+        }
+        if (current.getBlock() instanceof AirBlock && desired.getBlock() instanceof AirBlock) {
+            return true;
+        }
+        if (current.getBlock() instanceof AirBlock && Baritone.settings().okIfAir.value.contains(desired.getBlock())) {
+            return true;
+        }
+        if (desired.getBlock() instanceof AirBlock && Baritone.settings().buildIgnoreBlocks.value.contains(current.getBlock())) {
+            return true;
+        }
+        if (!(current.getBlock() instanceof AirBlock) && Baritone.settings().buildIgnoreExisting.value && !itemVerify) {
+            return true;
+        }
+        if (Baritone.settings().buildValidSubstitutes.value.getOrDefault(desired.getBlock(), Collections.emptyList()).contains(current.getBlock()) && !itemVerify) {
+            return true;
+        }
+        return current.getBlock().equals(desired.getBlock());
+    }
+
+    private static boolean approxValid(BlockState current, BlockState desired, boolean itemVerify) {
+        if (desired == null) {
+            return true;
+        }
+        if (current.getBlock() instanceof LiquidBlock && Baritone.settings().okIfWater.value) {
+            return true;
+        }
+        if (current.getBlock() instanceof AirBlock && desired.getBlock() instanceof AirBlock) {
+            return true;
+        }
+        if (current.getBlock() instanceof AirBlock && Baritone.settings().okIfAir.value.contains(desired.getBlock())) {
+            return true;
+        }
+        if (desired.getBlock() instanceof AirBlock && Baritone.settings().buildIgnoreBlocks.value.contains(current.getBlock())) {
+            return true;
+        }
+        if (!(current.getBlock() instanceof AirBlock) && Baritone.settings().buildIgnoreExisting.value && !itemVerify) {
+            return true;
+        }
+        if (Baritone.settings().buildValidSubstitutes.value.getOrDefault(desired.getBlock(), Collections.emptyList()).contains(current.getBlock()) && !itemVerify) {
+            return true;
+        }
+        Map<String, String> desiredProperties = BlockPlacementAnalyzer.mapProperties(desired);
+        if (!desiredProperties.isEmpty() && current.getBlock().equals(desired.getBlock())){
+            Map<Direction, Boolean> desiredLinker = createDirectionPropertyLinker(desiredProperties);
+            if (!desiredLinker.isEmpty()){
+                Map<String, String> currentProperties = BlockPlacementAnalyzer.mapProperties(current);
+                Map<Direction, Boolean> currentLinker = createDirectionPropertyLinker(currentProperties);
+                for (Map.Entry<Direction, Boolean> desLink : desiredLinker.entrySet()){
+                    if (currentLinker.get(desLink.getKey()) && !desLink.getValue()){
+                        return false;
+                    }
+                }
+                return true;
+            }
         }
         return sameBlockstate(current, desired);
     }

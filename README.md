@@ -146,3 +146,21 @@ We thank them for granting Baritone an OSS license so that we can make our softw
 ## Why is it called Baritone?
 
 It's named for FitMC's deep sultry voice.
+
+## My modified Settings for build (by Accropvp)
+
+allowInventory: true
+
+allowParkour: true
+
+allowParkourPlace: true
+
+breakFromAbove: true
+
+buildIgnoreBlock: air,dirt
+
+buildIgnorePropreties: open,shape
+
+buildInLayer: true
+
+skipFailedLayer: true
